@@ -12,20 +12,42 @@ except ImportError:
 
 _OS = platform.system()  # "Windows" | "Darwin" | "Linux"
 
-_SAFE_ROOTS: list[Path] = [
-    Path.home(),
-]
+def _blocked_roots() -> list[Path]:
+    """
+    SHADOW is a local-first assistant: it must be able to work with any
+    accessible path on the machine (other drives, C:\\xampp\\htdocs, etc.),
+    not just the user's home directory — that broad access is subject to
+    the real OS filesystem permissions (a PermissionError from the OS is
+    caught and reported like any other error, same as before).
+
+    Only a short list of genuinely catastrophic system roots is blocked
+    outright, so a misheard command can't wipe the OS itself.
+    """
+    if _OS == "Windows":
+        return [Path(os.environ.get("WINDIR", r"C:\Windows"))]
+    if _OS == "Darwin":
+        return [Path("/System"), Path("/private/var/db")]
+    return [Path(p) for p in ("/boot", "/etc", "/sys", "/proc", "/usr", "/bin", "/sbin", "/lib")]
+
+_BLOCKED_ROOTS = _blocked_roots()
 
 def _is_safe_path(target: Path) -> bool:
-    """Verilen path _SAFE_ROOTS içinde mi? Değilse işlemi reddet."""
+    """Reject an entire drive/filesystem root and the OS-critical system
+    directory; everything else is allowed subject to real OS permissions."""
     try:
         resolved = target.resolve()
-        return any(
-            resolved == root.resolve() or resolved.is_relative_to(root.resolve())
-            for root in _SAFE_ROOTS
-        )
     except Exception:
         return False
+    if resolved == Path(resolved.anchor):
+        return False
+    for root in _BLOCKED_ROOTS:
+        try:
+            root_r = root.resolve()
+        except Exception:
+            continue
+        if resolved == root_r or resolved.is_relative_to(root_r):
+            return False
+    return True
 
 def _get_desktop() -> Path:
     if _OS == "Linux":

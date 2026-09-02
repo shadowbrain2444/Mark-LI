@@ -21,9 +21,11 @@ It's not just an assistant — it's an extension of your digital life.
 | Feature | Description |
 |---|---|
 | 🧩 Plugin System | Drop a single `.py` file into `plugins/` — SHADOW learns a new skill on next launch |
-| 🎙️ Real-time Voice | Ultra-low latency conversation in any language via Gemini Live API |
+| 🗣️ Local Wake Word | SHADOW only wakes on "Wake up Shadow" — detected fully offline (Vosk), no audio leaves the device while sleeping |
+| 🛑 Stop Command | "Stop Shadow" instantly halts speech/listening and returns SHADOW to sleep — mic drops back to wake-word-only |
+| 🎙️ Real-time Voice | Ultra-low latency conversation in any language via Gemini Live API, once SHADOW is awake |
 | 💓 Affective Dialog | Hears the emotion in your voice and adapts its tone in response |
-| 🤫 Proactive Audio | Knows when you're not talking to it — background chatter never triggers a reply |
+| 🤫 Proactive Audio | While ACTIVE, knows when you're not talking to it — background chatter never triggers a reply |
 | ♾️ Unlimited Sessions | Sliding-window context compression — one conversation can last for hours |
 | 🖥️ System Control | Launch apps, adjust volume/brightness, WiFi, shortcuts, power — all by voice |
 | 🧩 Autonomous Tasks | High-level planning for complex multi-step goals via agent mode |
@@ -71,8 +73,11 @@ Safety is built in at three layers: a broken or badly written plugin can **never
 ### 💓 Affective Dialog — SHADOW Hears How You Feel
 Powered by Gemini Live's native audio understanding, SHADOW now picks up the emotion in your voice — excitement, frustration, fatigue — and adapts its own tone in response. Late-night tired questions get calm answers; excited announcements get energy back.
 
+### 🗣️ Local Wake Word — SHADOW Only Wakes When You Ask It To
+SHADOW stays asleep until you say **"Wake up Shadow"**. That phrase is detected entirely offline by a local, grammar-constrained Vosk recognizer — while sleeping, nothing but that one phrase can wake it, and no microphone audio is ever sent anywhere. Claps, snaps, slaps, keyboard noise, TV audio, and unrelated speech (including phrases like "Shadow" or "Jarvis" on their own) are all ignored by design. Say **"Stop Shadow"** at any time to instantly stop speech, listening, and command processing and drop back to sleep.
+
 ### 🤫 Proactive Audio — Knows When You're Not Talking to It
-The biggest quality-of-life upgrade for an always-listening assistant: SHADOW can now tell when speech isn't addressed to it. Talking to someone in the room, taking a phone call, TV in the background — it stays silent instead of interjecting. No wake word needed, no accidental replies.
+Once SHADOW is awake, it can tell when speech isn't addressed to it. Talking to someone in the room, taking a phone call, TV in the background — it stays silent instead of interjecting, without you needing to say "Stop Shadow" for every aside.
 
 ### ♾️ Unlimited Session Length — The Conversation Never Dies
 Sliding-window context compression means the Live session no longer terminates when the context window fills up. Combined with session resumption, SHADOW holds one continuous conversation for hours without losing the thread.
@@ -152,7 +157,8 @@ Mark LI/
 │   └── long_term.json        # Persistent store: identity, preferences, projects, sessions, monitors
 ├── core/
 │   ├── prompt.txt            # Assistant personality and tool-routing rules
-│   └── plugin_loader.py      # Plugin engine — discovery, validation, crash isolation
+│   ├── plugin_loader.py      # Plugin engine — discovery, validation, crash isolation
+│   └── wake_word.py          # Local offline wake-word / stop-phrase detection (Vosk)
 └── config/
     └── api_keys.json         # API key, OS setting, assistant name, user name
 ```

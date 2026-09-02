@@ -30,6 +30,7 @@ if _platform.system() == "Windows":
 # ─────────────────────────────────────────────────────────────────────────────
 
 import asyncio
+import contextlib
 import re
 import threading
 import time
@@ -71,8 +72,9 @@ from actions.background_monitor import (
     add_monitor, remove_monitor, list_monitors, check_all as monitor_check_all,
 )
 from actions.web_search        import _news as _fetch_news_sync
-from memory.config_manager     import get_brief_enabled
+from memory.config_manager     import get_brief_enabled, get_wake_phrase, get_stop_phrase
 from core.plugin_loader        import discover_plugins
+from core.wake_word            import LocalPhraseListener
 
 def get_base_dir():
     if getattr(sys, "frozen", False):
@@ -560,6 +562,24 @@ TOOL_DECLARATIONS = [
     },
 ]
 
+class _StopShadowSignal(Exception):
+    """
+    Raised internally the instant the local "stop shadow" phrase is heard.
+    Unwinds the active session's TaskGroup (closing the Gemini Live session
+    and the mic InputStream along the way) so SHADOW returns to SLEEPING
+    instead of auto-reconnecting like a transient network error would.
+    """
+    pass
+
+
+def _contains_stop_signal(exc: BaseException) -> bool:
+    if isinstance(exc, _StopShadowSignal):
+        return True
+    if isinstance(exc, BaseExceptionGroup):
+        return any(_contains_stop_signal(sub) for sub in exc.exceptions)
+    return False
+
+
 class SHADOWLive:
 
     def __init__(self, ui: SHADOWUI):
@@ -588,6 +608,15 @@ class SHADOWLive:
         self._proactive        = ProactiveEngine()
         self._last_user_speech = time.monotonic()  # updated on every user utterance
         self._session_log: list[str] = []          # conversation turns for end-of-session summary
+
+        # ── Wake-word / stop-phrase state machine (SLEEPING → WAKING → ACTIVE → STOPPED) ──
+        self._wake_phrase          = get_wake_phrase()
+        self._stop_phrase          = get_stop_phrase()
+        self._wake_listener        = LocalPhraseListener([self._wake_phrase])
+        self._active_stop_listener = None            # LocalPhraseListener, live only while ACTIVE
+        self._stop_event: asyncio.Event | None = None  # set the instant "stop shadow" is heard
+        self._external_wake_event: asyncio.Event | None = None  # set by typed input while SLEEPING
+        self._pending_text_wake: str | None = None   # text typed while SLEEPING, sent once ACTIVE
 
         self._enhanced_live = True  # affective dialog + proactive audio; auto-disabled if the server rejects them
         _core_names = {t["name"] for t in TOOL_DECLARATIONS}
@@ -640,15 +669,24 @@ class SHADOWLive:
         return url, key, f"{url}/auto-login?key={key}", manual
 
     def _on_text_command(self, text: str):
-        if not self._loop or not self.session:
+        if not self._loop:
             return
-        asyncio.run_coroutine_threadsafe(
-            self.session.send_client_content(
-                turns={"parts": [{"text": text}]},
-                turn_complete=True
-            ),
-            self._loop
-        )
+        if self.session:
+            asyncio.run_coroutine_threadsafe(
+                self.session.send_client_content(
+                    turns={"parts": [{"text": text}]},
+                    turn_complete=True
+                ),
+                self._loop
+            )
+            return
+        # SHADOW is SLEEPING/STOPPED — no active session. Typed text is
+        # explicit user intent (unlike ambient sound), so it wakes SHADOW
+        # exactly like the wake phrase would, then gets delivered once the
+        # session connects.
+        self._pending_text_wake = text
+        if self._external_wake_event is not None:
+            self._loop.call_soon_threadsafe(self._external_wake_event.set)
 
     def set_speaking(self, value: bool):
         with self._speaking_lock:
@@ -676,6 +714,20 @@ class SHADOWLive:
         if self._turn_done_event:
             self._turn_done_event.clear()
         self.ui.write_log("SYS: Interrupted — listening...")
+
+    def _on_stop_phrase_detected(self) -> None:
+        """
+        Runs on the event loop the instant local recognition hears "stop
+        shadow". High priority: stop speaking/listening immediately and
+        signal the active session to tear down — never sent to the LLM as
+        a normal conversational turn.
+        """
+        if self._stop_event is None or self._stop_event.is_set():
+            return
+        self.ui.write_log(f'SYS: "{self._stop_phrase.title()}" detected — stopping.')
+        self.ui.set_state("STOPPED")
+        self.interrupt()
+        self._stop_event.set()
 
     def speak(self, text: str):
         if not self._loop or not self.session:
@@ -964,10 +1016,20 @@ class SHADOWLive:
         loop = asyncio.get_event_loop()
 
         def callback(indata, frames, time_info, status):
+            data = indata.tobytes()
+
+            # "Stop Shadow" has priority over everything else: checked locally,
+            # unconditionally (even while muted or SHADOW is mid-speech), so it
+            # is never queued up behind a normal conversational turn.
+            stop_listener = self._active_stop_listener
+            if stop_listener is not None:
+                matched = stop_listener.feed(data)
+                if matched:
+                    loop.call_soon_threadsafe(self._on_stop_phrase_detected)
+
             with self._speaking_lock:
                 SHADOW_speaking = self._is_speaking
             if not SHADOW_speaking and not self.ui.muted and not self._phone_active:
-                data = indata.tobytes()
                 loop.call_soon_threadsafe(
                     self.out_queue.put_nowait,
                     {"data": data, "mime_type": "audio/pcm"}
@@ -1470,6 +1532,73 @@ class SHADOWLive:
 
     # ── main loop ───────────────────────────────────────────────────────────
 
+    async def _sleep_until_wake(self) -> bool:
+        """
+        SLEEPING phase — mic mode WAKE_WORD_ONLY. Local grammar-constrained
+        Vosk recognition is the ONLY thing touching the microphone here;
+        nothing is streamed to any cloud service while SHADOW sleeps.
+
+        Returns True once SHADOW should wake (the wake phrase was heard
+        locally, or the user typed a command — explicit intent either way),
+        or False if listening was cancelled without a match.
+        """
+        self.set_speaking(False)
+        self.ui.set_state("SLEEPING")
+        if self._dashboard:
+            await self._dashboard.broadcast({"type": "status", "state": "sleeping"})
+        self.ui.write_log(
+            f'SYS: Sleeping — mic is wake-word only (local, offline). '
+            f'Say "{self._wake_phrase.title()}" to wake SHADOW.'
+        )
+
+        loop       = asyncio.get_event_loop()
+        local_stop = threading.Event()
+        self._external_wake_event = asyncio.Event()
+
+        voice_fut = loop.run_in_executor(None, self._wake_listener.listen_blocking, local_stop)
+        ext_fut   = asyncio.ensure_future(self._external_wake_event.wait())
+
+        try:
+            done, _pending = await asyncio.wait(
+                {voice_fut, ext_fut}, return_when=asyncio.FIRST_COMPLETED
+            )
+        finally:
+            local_stop.set()   # release the wake-word mic thread either way
+            ext_fut.cancel()
+
+        if ext_fut in done:
+            self.ui.write_log("SYS: Typed command received — waking up.")
+            with contextlib.suppress(Exception):
+                await voice_fut   # wait for the mic thread to actually release the device
+            self.ui.set_state("WAKING")
+            return True
+
+        try:
+            matched = await voice_fut
+        except Exception as e:
+            self.ui.write_log(
+                f"ERR: Local wake-word engine unavailable ({e}). "
+                "Install it with: pip install vosk"
+            )
+            await asyncio.sleep(10)
+            return False
+
+        if matched:
+            self.ui.write_log(f'SYS: "{self._wake_phrase.title()}" detected — waking up.')
+            self.ui.set_state("WAKING")
+            return True
+        return False
+
+    async def _watch_stop_request(self) -> None:
+        """Bridges the local stop-phrase detector into the active session's
+        TaskGroup: the instant _stop_event is set, unwind the whole session
+        (closes the Gemini Live connection and the mic stream) instead of
+        letting "stop shadow" reach the LLM as a normal conversational turn."""
+        if self._stop_event is None:
+            return
+        await self._stop_event.wait()
+        raise _StopShadowSignal()
+
     async def run(self):
         self._loop = asyncio.get_event_loop()
 
@@ -1485,6 +1614,20 @@ class SHADOWLive:
             print(f"[Dashboard] Disabled: {e}")
             self._dashboard = None
 
+        while True:
+            woke = await self._sleep_until_wake()
+            if not woke:
+                continue
+            await self._run_active_session()
+
+    async def _run_active_session(self) -> None:
+        """
+        ACTIVE phase — mic mode ACTIVE_LISTENING. Connects to Gemini Live
+        and stays connected across transient errors (existing reconnect/
+        backoff behaviour below), until either API reconfiguration is
+        needed or the user says "Stop Shadow" — at which point this returns
+        and SHADOW goes back to SLEEPING (see run()).
+        """
         while True:
             try:
                 print("[SHADOW] Connecting...")
@@ -1516,12 +1659,23 @@ class SHADOWLive:
                     self._vision_last_time     = 0.0
                     self._interrupted          = False
 
+                    # Stop-phrase watch — local-only, live for this session
+                    self._stop_event           = asyncio.Event()
+                    self._active_stop_listener = LocalPhraseListener([self._stop_phrase])
+
                     print("[SHADOW] Connected.")
                     self.ui.set_state("LISTENING")
                     self.ui.write_log("SYS: SHADOW online.")
 
                     if self._dashboard:
                         await self._dashboard.broadcast({"type": "status", "state": "active"})
+
+                    if self._pending_text_wake:
+                        _txt = self._pending_text_wake
+                        self._pending_text_wake = None
+                        tg.create_task(session.send_client_content(
+                            turns={"parts": [{"text": _txt}]}, turn_complete=True,
+                        ))
 
                     tg.create_task(self._send_realtime())
                     tg.create_task(self._listen_audio())
@@ -1530,6 +1684,7 @@ class SHADOWLive:
                     tg.create_task(self._run_system_monitor())
                     tg.create_task(self._run_background_monitor())
                     tg.create_task(self._run_proactive_mode())
+                    tg.create_task(self._watch_stop_request())
                     if self._dashboard:
                         tg.create_task(self._relay_phone_audio())
 
@@ -1548,6 +1703,16 @@ class SHADOWLive:
                 # externally, which `except Exception` would miss, letting the
                 # exception escape the while-loop and causing asyncio.run() to
                 # start shutdown — resulting in "executor after shutdown" errors).
+
+                # "Stop Shadow" — not a transient error: end this session and
+                # go back to SLEEPING instead of auto-reconnecting.
+                if _contains_stop_signal(e):
+                    self.ui.write_log(
+                        f'SYS: Session ended — "{self._stop_phrase.title()}" heard.'
+                    )
+                    self._conn_backoff = 3
+                    return
+
                 err_str = str(e)
                 print(f"[SHADOW] Error ({type(e).__name__}): {e}")
                 traceback.print_exc()
@@ -1594,6 +1759,8 @@ class SHADOWLive:
                     self._conn_backoff = 3
             finally:
                 self.session = None
+                self._active_stop_listener = None
+                self._stop_event = None
                 # Only save if there was a real conversation (≥3 turns)
                 if len(self._session_log) >= 3:
                     asyncio.create_task(self._save_session_summary())

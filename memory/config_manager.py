@@ -61,6 +61,20 @@ def get_user_name() -> str:
     return load_api_keys().get("user_name", "")
 
 
+DEFAULT_WAKE_PHRASE = "wake up shadow"
+DEFAULT_STOP_PHRASE = "stop shadow"
+
+
+def get_wake_phrase() -> str:
+    """Return the configured wake phrase (normalized lowercase)."""
+    return (load_api_keys().get("wake_phrase") or DEFAULT_WAKE_PHRASE).strip().lower()
+
+
+def get_stop_phrase() -> str:
+    """Return the configured stop phrase (normalized lowercase)."""
+    return (load_api_keys().get("stop_phrase") or DEFAULT_STOP_PHRASE).strip().lower()
+
+
 def save_assistant_config(assistant_name: str, user_name: str) -> None:
     """Persist assistant name and user name to config."""
     ensure_config_dir()
