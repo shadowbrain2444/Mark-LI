@@ -62,24 +62,48 @@ class GestureConfig:
     # louder, so they need a higher bar to avoid matching ordinary noise;
     # snaps are quieter and need a lower one just to be seen at all, with
     # duration/spectral checks below doing the real discrimination work.
+    # These are physically-motivated starting points, not values measured
+    # against real recordings — widen/lower them via config if real snaps
+    # in your room aren't crossing the bar (see the [Gesture] diagnostic
+    # logs, which report the actual measured numbers on every rejection).
     clap_detection_threshold: float = 6.0
-    snap_detection_threshold: float = 3.0
-    min_absolute_rms: float = 250.0        # int16 RMS floor so near-silence doesn't cause false onsets
+    snap_detection_threshold: float = 3.2
+    min_absolute_rms: float = 200.0        # int16 RMS floor so near-silence doesn't cause false onsets
 
     # Impulse shape — duration in ms, spectral centroid in Hz.
     clap_min_duration_ms: float = 15.0
     clap_max_duration_ms: float = 90.0
     clap_max_centroid_hz: float = 3500.0
-    snap_min_duration_ms: float = 3.0
+    snap_min_duration_ms: float = 2.0
     snap_max_duration_ms: float = 45.0
-    snap_min_centroid_hz: float = 2000.0
+    snap_min_centroid_hz: float = 1800.0
     max_impulse_duration_ms: float = 150.0  # longer than this: not a clap/snap (speech, etc.) — discard
+
+    # A real finger snap happens as an isolated event in an otherwise quiet
+    # moment. Speech plosives (p/t/k/b) are acoustically similar short
+    # broadband transients, but they arrive embedded in a stream of other
+    # nearby transients (the rest of the word/sentence) — so requiring some
+    # quiet time since the previous transient is a much stronger, physically
+    # grounded way to reject "speech that sounds snap-like" than tightening
+    # duration/centroid alone (verified: without this, plosive-heavy speech
+    # reliably produces false double-snaps; with it, none did in testing).
+    # Kept below double_snap_min_interval_ms so the second snap of a genuine
+    # fast double-snap is never rejected by this.
+    snap_min_isolation_ms: float = 120.0
+
+    # Adaptive noise floor: rises slowly and is capped, so a loud sustained
+    # passage (SHADOW talking, the user in conversation) can't drag the
+    # floor up to the point where a real clap/snap no longer clears the
+    # onset threshold — which is the likely cause of gestures working while
+    # SLEEPING (quiet room) but not while ACTIVE (mid-conversation).  It
+    # falls back down faster once things go quiet again.
+    noise_floor_ceiling: float = 3500.0
 
     # Double-event timing, per gesture kind.
     double_clap_min_interval_ms: float = 120.0
     double_clap_max_interval_ms: float = 600.0
-    double_snap_min_interval_ms: float = 100.0
-    double_snap_max_interval_ms: float = 500.0
+    double_snap_min_interval_ms: float = 150.0
+    double_snap_max_interval_ms: float = 550.0
 
     # Cooldowns / debounce.
     single_event_refractory_ms: float = 80.0    # ignore new onsets right after one closes (echo/tail)
@@ -118,10 +142,23 @@ class GestureDetector:
         # epoch (often already a large number) — 0.0 is not "the distant past".
         self._last_impulse_end = float("-inf")
         self._last_double_t = float("-inf")
+        self._got_first_block = False   # confirms the mic pipeline is actually reaching this detector
+
+        if not self.cfg.enabled_claps:
+            self._log("Double clap detector disabled")
+        if not self.cfg.enabled_snaps:
+            self._log("Double snap detector disabled")
 
     # ── public API ───────────────────────────────────────────────────────
 
     def feed(self, pcm_bytes: bytes) -> Optional[GestureKind]:
+        if not self._got_first_block:
+            self._got_first_block = True
+            if not pcm_bytes:
+                self._log("Snap detector: no audio input (empty block received)")
+            else:
+                self._log(f"Audio pipeline active — first block received ({len(pcm_bytes)} bytes)")
+
         chunk = np.frombuffer(pcm_bytes, dtype=np.int16)
         self._buf = np.concatenate([self._buf, chunk]) if self._buf.size else chunk
 
@@ -146,11 +183,21 @@ class GestureDetector:
         sustain_threshold = max(self._noise_floor * 2.0, self.cfg.min_absolute_rms * 0.5)
 
         if self._impulse is None:
-            # Idle: track noise floor, watch for an onset.
-            self._noise_floor = 0.98 * self._noise_floor + 0.02 * rms
+            # Idle: track noise floor — asymmetric (rises slowly, capped;
+            # falls faster) so a sustained loud passage (conversation, TTS
+            # playback) can't permanently drown out a real clap/snap.
+            if rms > self._noise_floor:
+                self._noise_floor = min(
+                    self.cfg.noise_floor_ceiling, 0.995 * self._noise_floor + 0.005 * rms
+                )
+            else:
+                self._noise_floor = max(
+                    self.cfg.min_absolute_rms * 0.3, 0.90 * self._noise_floor + 0.10 * rms
+                )
             in_refractory = (now - self._last_impulse_end) * 1000 < self.cfg.single_event_refractory_ms
             if (not in_refractory and rms >= self.cfg.min_absolute_rms
                     and rms >= onset_threshold):
+                self._log(f"Audio transient detected (rms={rms:.0f}, floor={self._noise_floor:.0f})")
                 self._impulse = _PendingImpulse(start_t=now, peak_rms=rms, samples=[frame])
             return None
 
@@ -164,35 +211,66 @@ class GestureDetector:
         if still_active and not too_long:
             return None
 
-        # Impulse closed — classify it.
+        # Impulse closed — classify it. Isolation = quiet time since the
+        # PREVIOUS impulse ended, measured before we overwrite that marker.
         closed = self._impulse
         self._impulse = None
+        isolation_ms = (closed.start_t - self._last_impulse_end) * 1000
         self._last_impulse_end = now
         if too_long:
             return None   # sustained sound (speech, etc.) — not a clap/snap
 
-        return self._classify_and_register(closed, duration_ms, now)
+        return self._classify_and_register(closed, duration_ms, now, isolation_ms)
 
     def _classify_and_register(self, imp: _PendingImpulse, duration_ms: float,
-                                now: float) -> Optional[GestureKind]:
+                                now: float, isolation_ms: float) -> Optional[GestureKind]:
         centroid_hz = _spectral_centroid(np.concatenate(imp.samples))
         peak = imp.peak_rms
         cfg = self.cfg
+        floor = self._noise_floor
+
+        clap_checks = {
+            "peak":     peak >= floor * cfg.clap_detection_threshold,
+            "duration": cfg.clap_min_duration_ms <= duration_ms <= cfg.clap_max_duration_ms,
+            "centroid": centroid_hz <= cfg.clap_max_centroid_hz,
+        }
+        snap_checks = {
+            "peak":       peak >= floor * cfg.snap_detection_threshold,
+            "duration":   cfg.snap_min_duration_ms <= duration_ms <= cfg.snap_max_duration_ms,
+            "centroid":   centroid_hz >= cfg.snap_min_centroid_hz,
+            "isolation":  isolation_ms >= cfg.snap_min_isolation_ms,
+        }
 
         kind: Optional[GestureKind] = None
-        if (cfg.enabled_claps and peak >= self._noise_floor * cfg.clap_detection_threshold
-                and cfg.clap_min_duration_ms <= duration_ms <= cfg.clap_max_duration_ms
-                and centroid_hz <= cfg.clap_max_centroid_hz):
+        if cfg.enabled_claps and all(clap_checks.values()):
             kind = GestureKind.CLAP
-        elif (cfg.enabled_snaps and peak >= self._noise_floor * cfg.snap_detection_threshold
-                and cfg.snap_min_duration_ms <= duration_ms <= cfg.snap_max_duration_ms
-                and centroid_hz >= cfg.snap_min_centroid_hz):
+        elif cfg.enabled_snaps and all(snap_checks.values()):
             kind = GestureKind.SNAP
 
         if kind is None:
+            self._log_rejection(duration_ms, peak, floor, centroid_hz, isolation_ms, clap_checks, snap_checks)
             return None   # ambiguous impulse (e.g. a keyboard/mouse click) — discard, don't guess
 
+        confidence = peak / max(floor, 1.0)
+        self._log(f"Possible {kind.value} — confidence: {confidence:.1f}x floor "
+                   f"(duration={duration_ms:.1f}ms centroid={centroid_hz:.0f}Hz isolation={isolation_ms:.0f}ms)")
         return self._register_event(kind, now)
+
+    def _log_rejection(self, duration_ms: float, peak: float, floor: float, centroid_hz: float,
+                        isolation_ms: float, clap_checks: dict, snap_checks: dict) -> None:
+        cfg = self.cfg
+        stats = (f"duration={duration_ms:.1f}ms peak/floor={peak / max(floor, 1):.1f}x "
+                 f"centroid={centroid_hz:.0f}Hz isolation={isolation_ms:.0f}ms")
+        reasons = []
+        if cfg.enabled_snaps:
+            failed = [k for k, ok in snap_checks.items() if not ok]
+            if failed:
+                reasons.append(f"not a snap ({'/'.join(failed)} out of range)")
+        if cfg.enabled_claps:
+            failed = [k for k, ok in clap_checks.items() if not ok]
+            if failed:
+                reasons.append(f"not a clap ({'/'.join(failed)} out of range)")
+        self._log(f"Transient rejected: {stats} — {'; '.join(reasons) if reasons else 'no kind enabled'}")
 
     def _register_event(self, kind: GestureKind, now: float) -> Optional[GestureKind]:
         cfg = self.cfg

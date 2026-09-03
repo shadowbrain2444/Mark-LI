@@ -103,7 +103,7 @@ def _load_system_prompt() -> str:
         return PROMPT_PATH.read_text(encoding="utf-8")
     except Exception:
         return (
-            "You are SHADOW, Tony Stark's AI assistant. "
+            "You are SHADOW, a personal AI assistant. "
             "Be concise, direct, and always use the provided tools to complete tasks. "
             "Never simulate or guess results — always call the appropriate tool."
         )
@@ -301,12 +301,20 @@ TOOL_DECLARATIONS = [
     },
     {
         "name": "file_controller",
-        "description": "Manages files and folders: list, create, delete, move, copy, rename, read, write, find, disk usage.",
+        "description": (
+            "Manages files and folders: list, create, delete, move, copy, rename, read, write, "
+            "find, disk usage — AND opening a path/drive/'This PC' visually in the file explorer. "
+            "Use action='open' for ANY request to visually open a folder or drive window (e.g. "
+            "'open Downloads', 'open This PC', 'open C drive', 'open D:\\Projects') — this actually "
+            "launches Explorer/Finder, unlike 'list' which only returns file names as text. "
+            "Use action='list_drives' when the user asks what drives exist, or says "
+            "'This PC' / 'my computer' / 'show drives' without naming one specifically."
+        ),
         "parameters": {
             "type": "OBJECT",
             "properties": {
-                "action":      {"type": "STRING", "description": "list | create_file | create_folder | delete | move | copy | rename | read | write | find | largest | disk_usage | organize_desktop | info"},
-                "path":        {"type": "STRING", "description": "File/folder path or shortcut: desktop, downloads, documents, home"},
+                "action":      {"type": "STRING", "description": "list | create_file | create_folder | delete | move | copy | rename | read | write | find | largest | disk_usage | organize_desktop | info | open | list_drives"},
+                "path":        {"type": "STRING", "description": "File/folder path or shortcut: desktop, downloads, documents, home, pictures, music, videos — or for 'open': a drive ('C drive', 'D:\\') or 'This PC'"},
                 "destination": {"type": "STRING", "description": "Destination path for move/copy"},
                 "new_name":    {"type": "STRING", "description": "New name for rename"},
                 "content":     {"type": "STRING", "description": "Content for create_file/write"},
