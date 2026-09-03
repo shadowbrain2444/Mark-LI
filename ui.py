@@ -539,7 +539,7 @@ class HudCanvas(QWidget):
             p.drawPixmap(int(cx - fsz / 2), int(cy - fsz / 2), scaled)
         else:
             orb_r = int(fw * 0.27 * self._scale)
-            oc    = (200, 0, 50) if self.muted else (0, 60, 110)
+            oc    = (200, 0, 50) if self.muted else (109, 0, 26)   # SHADOW maroon #6D001A
             for i in range(8, 0, -1):
                 r2  = int(orb_r * i / 8)
                 frc = i / 8
@@ -2104,11 +2104,11 @@ class MainWindow(QMainWindow):
         except ImportError:
             return False
 
-        CYAN   = (0, 212, 255)
-        DIM    = (0, 100, 140)
-        DARK   = (0, 6, 10)
-        GLOW   = (0, 160, 200)
-        WHITE  = (220, 240, 255)
+        CYAN   = (109, 0, 26)     # SHADOW maroon — kept name to minimize the diff below
+        DIM    = (74, 0, 18)
+        DARK   = (0, 0, 0)
+        GLOW   = (168, 16, 47)
+        WHITE  = (255, 255, 255)
 
         def _render(sz: int) -> PIL.Image.Image:
             S  = sz * 4                     # draw at 4× then downscale

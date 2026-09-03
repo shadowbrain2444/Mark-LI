@@ -7,13 +7,18 @@
   <style>
     *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
     :root {
-      --bg:     #07090f;
+      /* SHADOW brand — black / maroon / white */
+      --shadow-black:  #000000;
+      --shadow-maroon: #6d001a;
+      --shadow-white:  #ffffff;
+
+      --bg:     var(--shadow-black);
       --card:   rgba(255,255,255,0.04);
-      --border: rgba(255,255,255,0.08);
-      --accent: #6366f1;
-      --adim:   rgba(99,102,241,0.15);
-      --text:   #dde3ed;
-      --muted:  #5e6a7e;
+      --border: rgba(109,0,26,0.35);
+      --accent: var(--shadow-maroon);
+      --adim:   rgba(109,0,26,0.18);
+      --text:   var(--shadow-white);
+      --muted:  #8a7075;
     }
     html, body {
       height: 100%;
@@ -81,7 +86,7 @@
     .key-input:focus {
       border-color: var(--accent);
       background: var(--adim);
-      box-shadow: 0 0 0 3px rgba(99,102,241,0.12);
+      box-shadow: 0 0 0 3px rgba(109,0,26,0.25);
     }
     .err {
       font-size: 12px;
@@ -134,7 +139,7 @@
 </head>
 <body>
   <div class="card" id="card">
-    <div class="logo"><em>J</em>ARVIS</div>
+    <div class="logo"><em>S</em>HADOW</div>
     <div class="sub">Remote Access</div>
     <p id="reconnecting">Reconnecting…</p>
     <p class="hint">Press <strong style="color:var(--text)">Remote Control</strong> in the SHADOW desktop app to get a QR code or session key.</p>

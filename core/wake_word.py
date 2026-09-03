@@ -19,10 +19,7 @@ import threading
 import time
 from typing import Optional
 
-import sounddevice as sd
-
 SAMPLE_RATE = 16000
-_BLOCK      = 4000   # ~0.25s per read at 16kHz
 
 _model_lock   = threading.Lock()
 _shared_model = None  # cached vosk.Model — loaded once, shared by wake + stop listeners
@@ -50,16 +47,14 @@ class LocalPhraseListener:
     """
     Grammar-constrained local phrase detector.
 
-    Two usage modes:
-      - listen_blocking(stop_flag): owns the microphone (opens its own
-        InputStream) and blocks the calling thread until one of `phrases`
-        is recognized or `stop_flag` is set. Used while SLEEPING — this is
-        the ONLY thing allowed to touch the mic in that state (mic mode
-        WAKE_WORD_ONLY).
-      - feed(pcm_bytes): does not own a stream; processes externally
-        supplied raw int16 mono PCM at SAMPLE_RATE. Used while ACTIVE to
-        watch for "stop shadow" on the audio already being captured for
-        the conversation, without opening a second competing input stream.
+    feed(pcm_bytes) processes externally supplied raw int16 mono PCM at
+    SAMPLE_RATE — it never opens its own microphone stream. This detector
+    is always used as one of possibly several taps on a single, centrally
+    owned mic stream (see SHADOWLive._run_sleeping_mic for SLEEPING, and
+    the _listen_audio tap for ACTIVE's "stop shadow" detection) — never as
+    the sole/exclusive owner of the microphone, so it can run alongside
+    gesture (clap/snap) detection on the same audio without a second
+    competing input stream.
     """
 
     def __init__(self, phrases: list[str], cooldown_s: float = 1.5):
@@ -80,6 +75,19 @@ class LocalPhraseListener:
         rec.SetWords(False)
         self._recognizer = rec
         return rec
+
+    def ensure_ready(self) -> None:
+        """
+        Explicitly initialize the recognizer (forcing a fresh one), letting
+        any failure (e.g. vosk not installed, model download failed)
+        propagate to the caller. feed() deliberately swallows this error
+        instead — it's meant to be safe to call opportunistically from a tap
+        — so callers that need to know upfront whether voice detection is
+        actually available should call this first.
+        """
+        with self._lock:
+            self._recognizer = None
+            self._ensure_recognizer()
 
     def _check_text(self, text: str) -> Optional[str]:
         text = _normalize(text)
@@ -107,35 +115,3 @@ class LocalPhraseListener:
                 return self._check_text(result.get("text", ""))
         return None
 
-    def listen_blocking(self, stop_flag: threading.Event) -> Optional[str]:
-        """
-        Opens the microphone (WAKE_WORD_ONLY — nothing else reads it while
-        this runs) and blocks until a configured phrase matches or
-        `stop_flag` is set externally. Returns the matched phrase, or None
-        if cancelled without a match.
-        """
-        with self._lock:
-            self._recognizer = None
-            try:
-                self._ensure_recognizer()
-            except Exception as e:
-                self._init_error = e
-                raise
-
-        matched: list[Optional[str]] = [None]
-
-        def _callback(indata, frames, time_info, status):
-            if matched[0] is not None or stop_flag.is_set():
-                return
-            m = self.feed(bytes(indata))
-            if m:
-                matched[0] = m
-
-        with sd.RawInputStream(
-            samplerate=SAMPLE_RATE, channels=1, dtype="int16",
-            blocksize=_BLOCK, callback=_callback,
-        ):
-            while matched[0] is None and not stop_flag.is_set():
-                time.sleep(0.05)
-
-        return matched[0]
