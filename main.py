@@ -580,6 +580,36 @@ def _contains_stop_signal(exc: BaseException) -> bool:
     return False
 
 
+def _flatten_exc_text(exc: BaseException) -> str:
+    """
+    Collect every message in an exception into one searchable string.
+
+    str(some_exception_group) does NOT include its sub-exceptions' messages
+    — only a generic "(N sub-exceptions)" summary — and asyncio.TaskGroup
+    (used for the whole active session) always raises a BaseExceptionGroup,
+    even for a single failing task. Classifying errors on plain str(e) was
+    silently matching nothing, ever; this walks the real exception tree.
+    """
+    parts = [str(exc), type(exc).__name__]
+    if isinstance(exc, BaseExceptionGroup):
+        for sub in exc.exceptions:
+            parts.append(_flatten_exc_text(sub))
+    if exc.__cause__ is not None:
+        parts.append(_flatten_exc_text(exc.__cause__))
+    return " | ".join(parts)
+
+
+# Error-classification marker sets used in _run_active_session's except block.
+_AUTH_ERROR_MARKERS = (
+    "api key not valid", "1007", "1008", "policy violation",
+    "invalid authentication credentials", "permission_denied", "unauthenticated",
+)
+_NET_ERROR_MARKERS = (
+    "timeouterror", "timed out", "getaddrinfo", "cancellederror",
+    "connectionrefusederror", "oserror", "cannot connect",
+)
+
+
 class SHADOWLive:
 
     def __init__(self, ui: SHADOWUI):
@@ -1599,8 +1629,31 @@ class SHADOWLive:
         await self._stop_event.wait()
         raise _StopShadowSignal()
 
+    def _log_gemini_config_status(self) -> None:
+        """
+        Report whether Gemini is configured at all — WITHOUT touching the
+        network (so this costs nothing at startup) and WITHOUT ever printing
+        the key itself. Real validity can only be known once a connection is
+        actually attempted (see the auth-error handling in
+        _run_active_session), so that part is deliberately reported UNKNOWN.
+        """
+        try:
+            key = _get_api_key()
+        except Exception:
+            key = ""
+        present = bool(key and len(key.strip()) > 15)
+        print(f"[Gemini] Provider configured: {'YES' if present else 'NO'}")
+        print(f"[Gemini] Credentials present: {'YES' if present else 'NO'}")
+        print("[Gemini] Credentials valid: UNKNOWN (verified on first connection attempt)")
+        if not present:
+            self.ui.write_log(
+                "ERR: Gemini is not configured — no API key found. "
+                "Active sessions will fail until one is set."
+            )
+
     async def run(self):
         self._loop = asyncio.get_event_loop()
+        self._log_gemini_config_status()
 
         # Start dashboard (optional — needs: pip install fastapi "uvicorn[standard]" cryptography)
         try:
@@ -1713,18 +1766,23 @@ class SHADOWLive:
                     self._conn_backoff = 3
                     return
 
-                err_str = str(e)
+                # Flattened, not str(e) — see _flatten_exc_text: str() of the
+                # BaseExceptionGroup that TaskGroup raises here never contains
+                # the real underlying error text, so every check below would
+                # silently never match against plain str(e).
+                err_str = _flatten_exc_text(e)
+                err_lc  = err_str.lower()
                 print(f"[SHADOW] Error ({type(e).__name__}): {e}")
                 traceback.print_exc()
 
                 # Enhanced audio features rejected by the server (preview API
                 # drift) — drop them and reconnect with the plain config.
                 if self._enhanced_live and (
-                    "INVALID_ARGUMENT" in err_str
-                    or "affective" in err_str.lower()
-                    or "proactiv" in err_str.lower()
-                    or "Unknown name" in err_str
-                    or "unexpected keyword" in err_str
+                    "invalid_argument" in err_lc
+                    or "affective" in err_lc
+                    or "proactiv" in err_lc
+                    or "unknown name" in err_lc
+                    or "unexpected keyword" in err_lc
                 ):
                     self._enhanced_live = False
                     self.ui.write_log(
@@ -1732,23 +1790,31 @@ class SHADOWLive:
                     )
                     continue
 
-                # Invalid API key — stop hammering the API, prompt re-configuration
-                if "API key not valid" in err_str or "1007" in err_str:
-                    self.ui.write_log("ERR: API key invalid — please re-enter your key.")
+                # Authentication/configuration failure (invalid, missing, or
+                # revoked API key; a key without Live API access — e.g. the
+                # WebSocket-level "1008 policy violation: invalid authentication
+                # credentials"). This is NOT transient: stop hammering Gemini
+                # with the same bad credentials every 3 seconds. Prompt for a
+                # corrected key instead, and only retry once one is provided.
+                if any(m in err_lc for m in _AUTH_ERROR_MARKERS):
+                    self.ui.write_log(
+                        "ERR: Gemini authentication failed — the configured API "
+                        "key is invalid, expired, missing, or lacks Live API access."
+                    )
+                    self.ui.write_log(
+                        "SYS: Unable to start active AI session. Wake-word "
+                        "detection is still running. Returning to SLEEPING."
+                    )
                     self.ui.set_state("SLEEPING")
                     self.ui.prompt_reconfig()
                     while not self.ui._win._ready:
                         await asyncio.sleep(1)
                     print("[SHADOW] New API key saved — reconnecting...")
-                    _conn_backoff = 3
+                    self._conn_backoff = 3
                     continue
 
-                # Network / timeout errors — log clearly and back off
-                is_net_err = any(k in err_str for k in (
-                    "TimeoutError", "timed out", "getaddrinfo", "CancelledError",
-                    "ConnectionRefusedError", "OSError", "Cannot connect",
-                ))
-                if is_net_err:
+                # Network / timeout / server errors — transient, back off and retry
+                if any(m in err_lc for m in _NET_ERROR_MARKERS):
                     _conn_backoff = min(getattr(self, "_conn_backoff", 3) * 2, 60)
                     self._conn_backoff = _conn_backoff
                     self.ui.write_log(
