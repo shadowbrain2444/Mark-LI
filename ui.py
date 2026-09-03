@@ -576,7 +576,7 @@ class HudCanvas(QWidget):
             txt, col = f"{sym}  LISTENING",  qcol(C.GREEN)
         else:
             sym = "●" if self._blink else "○"
-            txt, col = f"{sym}  {self.state}", qcol(C.PRI)
+            txt, col = f"{sym}  {self.state}", qcol(C.TEXT)
 
         p.setPen(QPen(col, 1))
         p.setFont(QFont("Courier New", 11, QFont.Weight.Bold))
@@ -1678,7 +1678,7 @@ class RemoteKeyOverlay(QWidget):
 
         self._url_lbl = QLabel(self._manual_url)
         self._url_lbl.setFont(QFont("Courier New", 8))
-        self._url_lbl.setStyleSheet(f"color: {C.PRI_DIM}; background: transparent;")
+        self._url_lbl.setStyleSheet(f"color: {C.WHITE}; background: transparent;")
         self._url_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self._url_lbl.setTextInteractionFlags(
             Qt.TextInteractionFlag.TextSelectableByMouse)
@@ -1768,13 +1768,15 @@ class RemoteKeyOverlay(QWidget):
             self._qr_label.setText("pip install\nqrcode[pil]")
             self._qr_label.setFont(QFont("Courier New", 8))
             self._qr_label.setStyleSheet(
-                "color: #888; background: white; border-radius: 10px; padding: 4px;"
+                f"color: {C.TEXT_DIM}; background: {C.PANEL}; border: 1px solid {C.BORDER}; "
+                f"border-radius: 10px; padding: 4px;"
             )
         except Exception:
             self._qr_label.setText(url[:28])
             self._qr_label.setFont(QFont("Courier New", 7))
             self._qr_label.setStyleSheet(
-                f"color: {C.PRI}; background: white; border-radius: 10px; padding: 4px;"
+                f"color: {C.PRI}; background: {C.PANEL}; border: 1px solid {C.BORDER}; "
+                f"border-radius: 10px; padding: 4px;"
             )
 
     def _tick(self):
@@ -2540,7 +2542,7 @@ class MainWindow(QMainWindow):
             l.setStyleSheet(f"color: {color}; background: transparent;")
             return l
 
-        lay.addWidget(_badge("MARK LI", C.PRI_DIM))
+        lay.addWidget(_badge("MARK LI", C.TEXT_DIM))
         lay.addSpacing(8)
         self._drawer_btn = QPushButton("⚙")
         self._drawer_btn.setFixedSize(26, 26)
@@ -2567,13 +2569,10 @@ class MainWindow(QMainWindow):
         self._title_lbl.setFont(QFont("Courier New", 17, QFont.Weight.Bold))
         self._title_lbl.setStyleSheet(f"color: {C.PRI}; background: transparent;")
         mid.addWidget(self._title_lbl)
-        _sub_text = ("Just A Rather Very Intelligent System"
-                     if _disp in ("SHADOW", "S.H.A.D.O.W")
-                     else "Personal AI Assistant")
-        self._sub_lbl = QLabel(_sub_text)
+        self._sub_lbl = QLabel("Personal AI Assistant")
         self._sub_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self._sub_lbl.setFont(QFont("Courier New", 7))
-        self._sub_lbl.setStyleSheet(f"color: {C.PRI_DIM}; background: transparent;")
+        self._sub_lbl.setStyleSheet(f"color: {C.TEXT_DIM}; background: transparent;")
         mid.addWidget(self._sub_lbl)
         lay.addLayout(mid)
         lay.addStretch()
@@ -2773,7 +2772,7 @@ class MainWindow(QMainWindow):
 
         hdr = QLabel("◈ CONTROLS")
         hdr.setFont(QFont("Courier New", 7, QFont.Weight.Bold))
-        hdr.setStyleSheet(f"color: {C.PRI_DIM}; background: transparent; "
+        hdr.setStyleSheet(f"color: {C.TEXT_DIM}; background: transparent; "
                           f"border-bottom: 1px solid {C.BORDER}; padding-bottom: 4px;")
         lay.addWidget(hdr)
 
@@ -3222,10 +3221,7 @@ class MainWindow(QMainWindow):
         display = self._assistant_name.upper()
         self.setWindowTitle(f"{display} — MARK LI")
         self._title_lbl.setText(display)
-        if display in ("SHADOW", "S.H.A.D.O.W"):
-            self._sub_lbl.setText("Just A Rather Very Intelligent System")
-        else:
-            self._sub_lbl.setText("Personal AI Assistant")
+        self._sub_lbl.setText("Personal AI Assistant")
         self._log._ai_name_lc = self._assistant_name.lower()
         self.hud._assistant_name = display
 

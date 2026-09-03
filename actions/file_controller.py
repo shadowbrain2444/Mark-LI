@@ -1,5 +1,8 @@
 import os
+import re
 import shutil
+import string
+import subprocess
 import platform
 from pathlib import Path
 from datetime import datetime
@@ -11,6 +14,11 @@ except ImportError:
     _SEND2TRASH = False
 
 _OS = platform.system()  # "Windows" | "Darwin" | "Linux"
+
+if _OS == "Windows":
+    _WIN_HIDE: dict = {"creationflags": subprocess.CREATE_NO_WINDOW}
+else:
+    _WIN_HIDE: dict = {}
 
 def _blocked_roots() -> list[Path]:
     """
@@ -118,6 +126,97 @@ def _resolve_path(raw: str) -> Path:
         return shortcuts[head.lower()] / rest if rest else shortcuts[head.lower()]
 
     return Path(raw).expanduser()
+
+_THIS_PC_PHRASES = {
+    "this pc", "my computer", "my pc", "computer",
+    "show drives", "open drives", "drives",
+}
+_DRIVE_LETTER_RE = re.compile(r"^([a-z]):\\?$", re.IGNORECASE)
+_DRIVE_WORD_RE   = re.compile(r"^(?:drive\s+([a-z])|([a-z])\s+drive)$", re.IGNORECASE)
+
+
+def _is_this_pc_phrase(raw: str) -> bool:
+    return raw.strip().strip('"').strip("'").lower() in _THIS_PC_PHRASES
+
+
+def _resolve_drive_phrase(raw: str) -> Path | None:
+    """Recognize 'C:', 'C:\\', 'C drive', 'drive C' -> Path('C:/'). None if
+    `raw` isn't phrased as a drive reference at all."""
+    s = raw.strip().strip('"').strip("'")
+    m = _DRIVE_LETTER_RE.match(s) or _DRIVE_WORD_RE.match(s)
+    if not m:
+        return None
+    letter = next(g for g in m.groups() if g)
+    return Path(f"{letter.upper()}:\\")
+
+
+def list_drives() -> str:
+    """Enumerate locally mounted drives/volumes actually present on this
+    machine — never assumes D:/E: exist, only reports what does."""
+    if _OS == "Windows":
+        drives = []
+        for letter in string.ascii_uppercase:
+            root = Path(f"{letter}:\\")
+            if not root.exists():
+                continue
+            try:
+                usage = shutil.disk_usage(root)
+                drives.append(f"{letter}:\\  ({_format_size(usage.free)} free of {_format_size(usage.total)})")
+            except Exception:
+                drives.append(f"{letter}:\\")
+        if not drives:
+            return "No drives found."
+        return "Available drives:\n" + "\n".join(drives)
+
+    if _OS == "Darwin":
+        vols = Path("/Volumes")
+        drives = [f"/Volumes/{v.name}" for v in vols.iterdir()] if vols.exists() else []
+        drives.insert(0, "/  (root)")
+        return "Available volumes:\n" + "\n".join(drives)
+
+    # Linux: report common mount points that actually exist
+    candidates = [Path("/")] + list(Path("/media", os.environ.get("USER", "")).glob("*")
+                                     if Path("/media").exists() else [])
+    mnt = Path("/mnt")
+    if mnt.exists():
+        candidates += list(mnt.glob("*"))
+    drives = [str(p) for p in candidates if p.exists()]
+    return "Available mounts:\n" + "\n".join(drives) if drives else "No additional mounts found."
+
+
+def open_in_explorer(path: str) -> str:
+    """Open a path (or a whole drive, or the 'This PC' / My Computer view)
+    in the OS's native file manager — a real visual launch, distinct from
+    list_files()'s programmatic listing."""
+    raw = (path or "").strip()
+
+    if not raw or _is_this_pc_phrase(raw):
+        target: Path | None = None   # "This PC" special view — no single path
+    else:
+        target = _resolve_drive_phrase(raw) or _resolve_path(raw)
+
+    if target is not None:
+        if not _is_safe_path(target):
+            return f"Access denied: {target}"
+        if not target.exists():
+            return f"Path not found: {target}"
+
+    try:
+        if _OS == "Windows":
+            if target is None:
+                subprocess.Popen(["explorer.exe", "shell:MyComputerFolder"], **_WIN_HIDE)
+            else:
+                subprocess.Popen(["explorer.exe", str(target)], **_WIN_HIDE)
+        elif _OS == "Darwin":
+            subprocess.Popen(["open", str(target) if target else str(Path.home())])
+        else:
+            opener = next((c for c in ("xdg-open", "nautilus", "thunar", "dolphin", "nemo")
+                           if shutil.which(c)), "xdg-open")
+            subprocess.Popen([opener, str(target) if target else str(Path.home())])
+        return f"Opened in file explorer: {target if target else 'This PC'}"
+    except Exception as e:
+        return f"Could not open file explorer: {e}"
+
 
 def _format_size(b: int) -> str:
     for unit in ["B", "KB", "MB", "GB", "TB"]:
@@ -569,6 +668,12 @@ def file_controller(
 
         elif action == "info":
             return get_file_info(path, name=name)
+
+        elif action == "open":
+            return open_in_explorer(path)
+
+        elif action == "list_drives":
+            return list_drives()
 
         else:
             return f"Unknown action: '{action}'"
