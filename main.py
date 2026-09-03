@@ -72,9 +72,12 @@ from actions.background_monitor import (
     add_monitor, remove_monitor, list_monitors, check_all as monitor_check_all,
 )
 from actions.web_search        import _news as _fetch_news_sync
-from memory.config_manager     import get_brief_enabled, get_wake_phrase, get_stop_phrase
+from memory.config_manager     import (
+    get_brief_enabled, get_wake_phrase, get_stop_phrase, get_gesture_config,
+)
 from core.plugin_loader        import discover_plugins
 from core.wake_word            import LocalPhraseListener
+from core.gesture              import GestureDetector, GestureKind
 
 def get_base_dir():
     if getattr(sys, "frozen", False):
@@ -363,11 +366,11 @@ TOOL_DECLARATIONS = [
     },
     {
         "name": "computer_control",
-        "description": "Direct computer control: type, click, hotkeys, scroll, move mouse, screenshots, find elements on screen.",
+        "description": "Direct computer control: type, click, hotkeys, scroll, move mouse, screenshots, find elements on screen, list open application windows, close a specific named application.",
         "parameters": {
             "type": "OBJECT",
             "properties": {
-                "action":      {"type": "STRING", "description": "type | smart_type | click | double_click | right_click | hotkey | press | scroll | move | copy | paste | screenshot | wait | clear_field | focus_window | screen_find | screen_click | random_data | user_data"},
+                "action":      {"type": "STRING", "description": "type | smart_type | click | double_click | right_click | hotkey | press | scroll | move | copy | paste | screenshot | wait | clear_field | focus_window | list_windows | close_window | screen_find | screen_click | random_data | user_data"},
                 "text":        {"type": "STRING", "description": "Text to type or paste"},
                 "x":           {"type": "INTEGER", "description": "X coordinate"},
                 "y":           {"type": "INTEGER", "description": "Y coordinate"},
@@ -639,12 +642,19 @@ class SHADOWLive:
         self._last_user_speech = time.monotonic()  # updated on every user utterance
         self._session_log: list[str] = []          # conversation turns for end-of-session summary
 
-        # ── Wake-word / stop-phrase state machine (SLEEPING → WAKING → ACTIVE → STOPPED) ──
+        # ── Wake/stop state machine (SLEEPING → WAKING → ACTIVE → STOPPING → SLEEPING) ──
+        # Every wake/stop source (voice, double-clap, double-snap, typed text) funnels
+        # through _request_wake()/_transition() and _request_stop() — no detector ever
+        # touches UI/session state directly.
+        self._current_state        = "SLEEPING"
         self._wake_phrase          = get_wake_phrase()
         self._stop_phrase          = get_stop_phrase()
         self._wake_listener        = LocalPhraseListener([self._wake_phrase])
         self._active_stop_listener = None            # LocalPhraseListener, live only while ACTIVE
-        self._stop_event: asyncio.Event | None = None  # set the instant "stop shadow" is heard
+        self._sleep_gesture        = None             # GestureDetector, live only while SLEEPING
+        self._active_gesture       = None             # GestureDetector, live only while ACTIVE
+        self._stop_event: asyncio.Event | None = None  # set the instant a stop source fires
+        self._last_stop_source: str | None = None     # which source fired the last stop (for logging)
         self._external_wake_event: asyncio.Event | None = None  # set by typed input while SLEEPING
         self._pending_text_wake: str | None = None   # text typed while SLEEPING, sent once ACTIVE
 
@@ -745,17 +755,38 @@ class SHADOWLive:
             self._turn_done_event.clear()
         self.ui.write_log("SYS: Interrupted — listening...")
 
-    def _on_stop_phrase_detected(self) -> None:
+    # ── Centralized state-transition controller ─────────────────────────────
+    # Every wake/stop detector (voice phrase, double-clap, double-snap, typed
+    # text) reports through _request_wake()/_request_stop() below — no
+    # detector is allowed to touch UI/session/mic state on its own.
+
+    def _transition(self, new_state: str, ui_state: str | None = None) -> None:
+        old = self._current_state
+        self._current_state = new_state
+        print(f"[SHADOW] State: {old} -> {new_state}")
+        self.ui.set_state(ui_state or new_state)
+
+    def _request_wake(self, source: str) -> None:
+        """Log which wake source fired. The actual SLEEPING->WAKING
+        transition happens in _sleep_until_wake, which calls this once it
+        has already decided (from whichever source resolved first) to wake."""
+        print(f"[SHADOW] Wake source: {source}")
+        self.ui.write_log(f"SYS: Wake source: {source}")
+
+    def _request_stop(self, source: str) -> None:
         """
-        Runs on the event loop the instant local recognition hears "stop
-        shadow". High priority: stop speaking/listening immediately and
-        signal the active session to tear down — never sent to the LLM as
-        a normal conversational turn.
+        Runs on the event loop the instant a stop source fires (voice
+        "stop shadow", double-clap, or double-snap while ACTIVE). High
+        priority: stop speaking/listening immediately and signal the active
+        session to tear down — never sent to the LLM as a normal
+        conversational turn, and never triggered twice for one stop event.
         """
         if self._stop_event is None or self._stop_event.is_set():
             return
-        self.ui.write_log(f'SYS: "{self._stop_phrase.title()}" detected — stopping.')
-        self.ui.set_state("STOPPED")
+        print(f"[SHADOW] Stop source: {source}")
+        self.ui.write_log(f"SYS: Stop source: {source}")
+        self._last_stop_source = source
+        self._transition("STOPPING")
         self.interrupt()
         self._stop_event.set()
 
@@ -1048,14 +1079,20 @@ class SHADOWLive:
         def callback(indata, frames, time_info, status):
             data = indata.tobytes()
 
-            # "Stop Shadow" has priority over everything else: checked locally,
-            # unconditionally (even while muted or SHADOW is mid-speech), so it
-            # is never queued up behind a normal conversational turn.
+            # Stop sources have priority over everything else: checked locally,
+            # unconditionally (even while muted or SHADOW is mid-speech), so a
+            # stop is never queued up behind a normal conversational turn.
             stop_listener = self._active_stop_listener
-            if stop_listener is not None:
-                matched = stop_listener.feed(data)
-                if matched:
-                    loop.call_soon_threadsafe(self._on_stop_phrase_detected)
+            if stop_listener is not None and stop_listener.feed(data):
+                loop.call_soon_threadsafe(self._request_stop, "VOICE_STOP_WORD")
+
+            gesture_detector = self._active_gesture
+            if gesture_detector is not None:
+                kind = gesture_detector.feed(data)
+                if kind is GestureKind.CLAP:
+                    loop.call_soon_threadsafe(self._request_stop, "DOUBLE_CLAP")
+                elif kind is GestureKind.SNAP:
+                    loop.call_soon_threadsafe(self._request_stop, "DOUBLE_FINGER_SNAP")
 
             with self._speaking_lock:
                 SHADOW_speaking = self._is_speaking
@@ -1562,49 +1599,94 @@ class SHADOWLive:
 
     # ── main loop ───────────────────────────────────────────────────────────
 
+    def _run_sleeping_mic(self, stop_flag: threading.Event) -> tuple[str, object] | None:
+        """
+        Owns the microphone for the entire SLEEPING phase (mic mode
+        WAKE_WORD_ONLY) and fans each audio block to BOTH the local
+        wake-phrase listener and the gesture (double-clap/double-snap)
+        detector. This is the one place that reads the mic while asleep —
+        neither detector opens a competing stream of its own, per the
+        centralized-controller requirement. Nothing here is sent to any
+        cloud service.
+
+        Returns ("voice", phrase) | ("gesture", GestureKind) on the first
+        match, or None if stop_flag was set with no match. Raises if the
+        local wake-word engine itself cannot initialize (e.g. vosk not
+        installed) — the voice wake phrase is required functionality, not
+        optional, so that failure is surfaced rather than silently running
+        gesture-only.
+        """
+        self._wake_listener.ensure_ready()
+        self._sleep_gesture = GestureDetector(config=get_gesture_config())
+
+        matched: list[tuple[str, object] | None] = [None]
+
+        def _callback(indata, frames, time_info, status):
+            if matched[0] is not None or stop_flag.is_set():
+                return
+            data = bytes(indata)
+            phrase = self._wake_listener.feed(data)
+            if phrase:
+                matched[0] = ("voice", phrase)
+                return
+            kind = self._sleep_gesture.feed(data)
+            if kind is not None:
+                matched[0] = ("gesture", kind)
+
+        with sd.RawInputStream(
+            samplerate=SEND_SAMPLE_RATE, channels=1, dtype="int16",
+            blocksize=800, callback=_callback,
+        ):
+            while matched[0] is None and not stop_flag.is_set():
+                time.sleep(0.05)
+
+        return matched[0]
+
     async def _sleep_until_wake(self) -> bool:
         """
-        SLEEPING phase — mic mode WAKE_WORD_ONLY. Local grammar-constrained
-        Vosk recognition is the ONLY thing touching the microphone here;
-        nothing is streamed to any cloud service while SHADOW sleeps.
+        SLEEPING phase — mic mode WAKE_WORD_ONLY. Local detection (voice
+        wake phrase + double-clap/double-snap gestures) is the ONLY thing
+        touching the microphone here; nothing is streamed to any cloud
+        service while SHADOW sleeps.
 
-        Returns True once SHADOW should wake (the wake phrase was heard
-        locally, or the user typed a command — explicit intent either way),
-        or False if listening was cancelled without a match.
+        Returns True once SHADOW should wake (voice phrase, gesture, or
+        typed text — explicit intent either way), or False if listening
+        was cancelled without a match.
         """
         self.set_speaking(False)
-        self.ui.set_state("SLEEPING")
+        self._transition("SLEEPING")
         if self._dashboard:
             await self._dashboard.broadcast({"type": "status", "state": "sleeping"})
         self.ui.write_log(
             f'SYS: Sleeping — mic is wake-word only (local, offline). '
-            f'Say "{self._wake_phrase.title()}" to wake SHADOW.'
+            f'Say "{self._wake_phrase.title()}", double-clap, or double-snap to wake SHADOW.'
         )
 
         loop       = asyncio.get_event_loop()
         local_stop = threading.Event()
         self._external_wake_event = asyncio.Event()
 
-        voice_fut = loop.run_in_executor(None, self._wake_listener.listen_blocking, local_stop)
-        ext_fut   = asyncio.ensure_future(self._external_wake_event.wait())
+        mic_fut = loop.run_in_executor(None, self._run_sleeping_mic, local_stop)
+        ext_fut = asyncio.ensure_future(self._external_wake_event.wait())
 
         try:
             done, _pending = await asyncio.wait(
-                {voice_fut, ext_fut}, return_when=asyncio.FIRST_COMPLETED
+                {mic_fut, ext_fut}, return_when=asyncio.FIRST_COMPLETED
             )
         finally:
-            local_stop.set()   # release the wake-word mic thread either way
+            local_stop.set()   # release the mic thread either way
             ext_fut.cancel()
 
         if ext_fut in done:
+            self._request_wake("TEXT_INPUT")
             self.ui.write_log("SYS: Typed command received — waking up.")
             with contextlib.suppress(Exception):
-                await voice_fut   # wait for the mic thread to actually release the device
-            self.ui.set_state("WAKING")
+                await mic_fut   # wait for the mic thread to actually release the device
+            self._transition("WAKING")
             return True
 
         try:
-            matched = await voice_fut
+            result = await mic_fut
         except Exception as e:
             self.ui.write_log(
                 f"ERR: Local wake-word engine unavailable ({e}). "
@@ -1613,9 +1695,16 @@ class SHADOWLive:
             await asyncio.sleep(10)
             return False
 
-        if matched:
-            self.ui.write_log(f'SYS: "{self._wake_phrase.title()}" detected — waking up.')
-            self.ui.set_state("WAKING")
+        if result is not None:
+            kind, detail = result
+            if kind == "voice":
+                self._request_wake("VOICE_WAKE_WORD")
+                self.ui.write_log(f'SYS: "{self._wake_phrase.title()}" detected — waking up.')
+            else:
+                source = "DOUBLE_CLAP" if detail is GestureKind.CLAP else "DOUBLE_FINGER_SNAP"
+                self._request_wake(source)
+                self.ui.write_log(f"SYS: {source.replace('_', ' ').title()} detected — waking up.")
+            self._transition("WAKING")
             return True
         return False
 
@@ -1712,12 +1801,13 @@ class SHADOWLive:
                     self._vision_last_time     = 0.0
                     self._interrupted          = False
 
-                    # Stop-phrase watch — local-only, live for this session
+                    # Stop watch — voice phrase + gestures, all local-only, live for this session
                     self._stop_event           = asyncio.Event()
                     self._active_stop_listener = LocalPhraseListener([self._stop_phrase])
+                    self._active_gesture       = GestureDetector(config=get_gesture_config())
 
                     print("[SHADOW] Connected.")
-                    self.ui.set_state("LISTENING")
+                    self._transition("ACTIVE", ui_state="LISTENING")
                     self.ui.write_log("SYS: SHADOW online.")
 
                     if self._dashboard:
@@ -1760,9 +1850,8 @@ class SHADOWLive:
                 # "Stop Shadow" — not a transient error: end this session and
                 # go back to SLEEPING instead of auto-reconnecting.
                 if _contains_stop_signal(e):
-                    self.ui.write_log(
-                        f'SYS: Session ended — "{self._stop_phrase.title()}" heard.'
-                    )
+                    src = self._last_stop_source or "VOICE_STOP_WORD"
+                    self.ui.write_log(f"SYS: Session ended — stop source: {src}.")
                     self._conn_backoff = 3
                     return
 
@@ -1826,6 +1915,7 @@ class SHADOWLive:
             finally:
                 self.session = None
                 self._active_stop_listener = None
+                self._active_gesture = None
                 self._stop_event = None
                 # Only save if there was a real conversation (≥3 turns)
                 if len(self._session_log) >= 3:

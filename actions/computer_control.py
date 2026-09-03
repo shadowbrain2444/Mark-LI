@@ -310,6 +310,50 @@ def _focus_window(title: str) -> str:
 
     return f"focus_window: unknown OS '{os_name}'"
 
+def _list_windows() -> str:
+    """Inspect open/running applications by their visible windows."""
+    try:
+        import pygetwindow as gw
+    except ImportError:
+        return "pygetwindow not installed. Run: pip install pygetwindow"
+    try:
+        titles = [
+            w.title.strip() for w in gw.getAllWindows()
+            if w.visible and w.title.strip() and w.width > 50 and w.height > 50
+        ]
+    except Exception as e:
+        return f"Could not list windows: {e}"
+    if not titles:
+        return "No visible application windows found."
+    return "Open windows:\n" + "\n".join(f"- {t}" for t in titles)
+
+
+def _close_window_by_title(title: str) -> str:
+    """Close a specific named application/window, not just whichever has focus."""
+    if not title:
+        return "No window title provided."
+    try:
+        import pygetwindow as gw
+    except ImportError:
+        return "pygetwindow not installed. Run: pip install pygetwindow"
+    try:
+        matches = [w for w in gw.getAllWindows() if title.lower() in w.title.lower() and w.visible]
+    except Exception as e:
+        return f"Could not search windows: {e}"
+    if not matches:
+        return f"No open window matching '{title}'."
+    closed = []
+    for w in matches:
+        try:
+            w.close()
+            closed.append(w.title)
+        except Exception as e:
+            print(f"[ComputerControl] Failed to close '{w.title}': {e}")
+    if not closed:
+        return f"Found '{title}' but could not close it."
+    return "Closed: " + ", ".join(closed)
+
+
 def _screen_find(description: str) -> tuple[int, int] | None:
     api_key = _get_api_key()
     if not api_key:
@@ -398,7 +442,9 @@ def computer_control(
       screenshot    — capture screen (safe path only)
       wait          — sleep N seconds
       clear_field   — select-all + delete
-      focus_window  — bring window to foreground
+      focus_window  — bring window to foreground (switch to a named app)
+      list_windows  — list open/running application windows
+      close_window  — close a specific named application/window
       screen_find   — AI element finder (returns x,y)
       screen_click  — AI element finder + click
       random_data   — generate fake form data
@@ -491,6 +537,12 @@ def computer_control(
 
         if action == "focus_window":
             return _focus_window(params.get("title", ""))
+
+        if action == "list_windows":
+            return _list_windows()
+
+        if action == "close_window":
+            return _close_window_by_title(params.get("title", ""))
 
         if action == "random_data":
             dt     = params.get("type", "name")
